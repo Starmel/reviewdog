@@ -319,6 +319,32 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		}
 		w.Write([]byte(`{"commit": {"id": "xxx"}}`))
 	})
+	// Draft Notes API handlers
+	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/draft_notes", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			atomic.AddInt32(&postCalled, 1)
+			got := new(gitlab.CreateDraftNoteOptions)
+			if err := json.NewDecoder(r.Body).Decode(got); err != nil {
+				t.Error(err)
+			}
+			// Verify body contains meta comment
+			if !strings.Contains(*got.Note, "<!-- __reviewdog__:") {
+				t.Errorf("body should contain meta comment, got: %s", *got.Note)
+			}
+			if err := json.NewEncoder(w).Encode(gitlab.DraftNote{ID: 1}); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
+		}
+	})
+	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/draft_notes/bulk_publish", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	ts := httptest.NewServer(mux)
 	defer ts.Close()

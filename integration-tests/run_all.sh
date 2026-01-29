@@ -40,6 +40,7 @@ TESTS=(
     "test_10_large_batch.sh"
     "test_11_api_error_handling.sh"
     "test_12_legacy_comments.sh"
+    "test_13_single_batch_create_and_resolve.sh"
 )
 
 PASSED=0
