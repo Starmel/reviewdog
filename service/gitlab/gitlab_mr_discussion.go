@@ -3,6 +3,7 @@ package gitlab
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"github.com/reviewdog/reviewdog"
 	"github.com/reviewdog/reviewdog/proto/rdf"
 	"github.com/reviewdog/reviewdog/service/commentutil"
+	"github.com/reviewdog/reviewdog/service/serviceutil"
 )
 
 const (
@@ -31,19 +33,23 @@ type MergeRequestDiscussionCommenter struct {
 	pr       int
 	sha      string
 	projects string
+	toolName string
 
-	muComments   sync.Mutex
-	postComments []*reviewdog.Comment
+	muComments          sync.Mutex
+	postComments        []*reviewdog.Comment
+	postedcs            commentutil.PostedComments
+	outdatedDiscussions map[string]*gitlab.Discussion // fingerprint -> discussion
 }
 
 // NewGitLabMergeRequestDiscussionCommenter returns a new MergeRequestDiscussionCommenter service.
 // MergeRequestDiscussionCommenter service needs git command in $PATH.
-func NewGitLabMergeRequestDiscussionCommenter(cli *gitlab.Client, owner, repo string, pr int, sha string) *MergeRequestDiscussionCommenter {
+func NewGitLabMergeRequestDiscussionCommenter(cli *gitlab.Client, owner, repo string, pr int, sha, toolName string) *MergeRequestDiscussionCommenter {
 	return &MergeRequestDiscussionCommenter{
 		cli:      cli,
 		pr:       pr,
 		sha:      sha,
 		projects: owner + "/" + repo,
+		toolName: toolName,
 	}
 }
 
@@ -59,26 +65,44 @@ func (g *MergeRequestDiscussionCommenter) Post(_ context.Context, c *reviewdog.C
 func (*MergeRequestDiscussionCommenter) ShouldPrependGitRelDir() bool { return true }
 
 // Flush posts comments which has not been posted yet.
+// Uses Draft Notes API for batch operations (single notification for all changes).
 func (g *MergeRequestDiscussionCommenter) Flush(ctx context.Context) error {
 	g.muComments.Lock()
 	defer g.muComments.Unlock()
 	defer func() { g.postComments = nil }()
-	postedcs, err := g.createPostedComments()
-	if err != nil {
-		return fmt.Errorf("failed to create posted comments: %w", err)
+
+	if err := g.setPostedComments(); err != nil {
+		return fmt.Errorf("failed to set posted comments: %w", err)
 	}
-	return g.postCommentsForEach(ctx, postedcs)
+
+	// Create all draft notes (new comments + resolve replies) then bulk publish once
+	draftsCreated, err := g.createDraftNotes(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Single bulk publish for all drafts (one notification)
+	if draftsCreated > 0 {
+		_, err := g.cli.DraftNotes.PublishAllDraftNotes(g.projects, int64(g.pr), gitlab.WithContext(ctx))
+		if err != nil {
+			return fmt.Errorf("failed to publish draft notes: %w", err)
+		}
+	}
+
+	return nil
 }
 
-func (g *MergeRequestDiscussionCommenter) createPostedComments() (commentutil.PostedComments, error) {
-	postedcs := make(commentutil.PostedComments)
+func (g *MergeRequestDiscussionCommenter) setPostedComments() error {
+	g.postedcs = make(commentutil.PostedComments)
+	g.outdatedDiscussions = make(map[string]*gitlab.Discussion)
+
 	discussions, err := listAllMergeRequestDiscussion(g.cli, g.projects, g.pr, &gitlab.ListMergeRequestDiscussionsOptions{
 		ListOptions: gitlab.ListOptions{
 			PerPage: 100,
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to list all merge request discussions: %w", err)
+		return fmt.Errorf("failed to list all merge request discussions: %w", err)
 	}
 	for _, d := range discussions {
 		for _, note := range d.Notes {
@@ -86,36 +110,65 @@ func (g *MergeRequestDiscussionCommenter) createPostedComments() (commentutil.Po
 			if pos == nil || pos.NewPath == "" || pos.NewLine == 0 || note.Body == "" {
 				continue
 			}
-			postedcs.AddPostedComment(pos.NewPath, int(pos.NewLine), note.Body)
+			// Extract meta comment to get fingerprint
+			if meta := serviceutil.ExtractMetaComment(note.Body); meta != nil {
+				g.postedcs.AddPostedComment(pos.NewPath, int(pos.NewLine), meta.GetFingerprint())
+				// Track discussions from the same tool for potential resolution
+				if meta.SourceName == g.toolName {
+					g.outdatedDiscussions[meta.GetFingerprint()] = d
+				}
+			} else {
+				// Legacy: fallback to body matching for comments without meta
+				g.postedcs.AddPostedComment(pos.NewPath, int(pos.NewLine), note.Body)
+			}
 		}
 	}
-	return postedcs, nil
+	return nil
 }
 
-func (g *MergeRequestDiscussionCommenter) postCommentsForEach(ctx context.Context, postedcs commentutil.PostedComments) error {
+// createDraftNotes creates draft notes for new comments and resolve replies.
+// Returns the total number of drafts created.
+func (g *MergeRequestDiscussionCommenter) createDraftNotes(ctx context.Context) (int, error) {
 	mr, _, err := g.cli.MergeRequests.GetMergeRequest(g.projects, int64(g.pr), nil, gitlab.WithContext(ctx))
 	if err != nil {
-		return fmt.Errorf("failed to get merge request: %w", err)
+		return 0, fmt.Errorf("failed to get merge request: %w", err)
 	}
 	targetBranch, _, err := g.cli.Branches.GetBranch(mr.TargetProjectID, mr.TargetBranch, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
+	var draftsCreated int
 	var eg errgroup.Group
+
+	// Create draft notes for new comments
 	for _, c := range g.postComments {
 		c := c
 		loc := c.Result.Diagnostic.GetLocation()
 		lnum := int(loc.GetRange().GetStart().GetLine())
-		body := commentutil.MarkdownComment(c)
 
+		if !c.Result.InDiffFile || lnum == 0 {
+			continue
+		}
+
+		fprint, err := serviceutil.Fingerprint(c.Result.Diagnostic)
+		if err != nil {
+			log.Printf("reviewdog: failed to calculate fingerprint: %v", err)
+			continue
+		}
+
+		if g.postedcs.IsPosted(c, lnum, fprint) {
+			delete(g.outdatedDiscussions, fprint)
+			continue
+		}
+
+		body := commentutil.MarkdownComment(c)
 		if suggestion := buildSuggestions(c); suggestion != "" {
 			body = body + "\n\n" + suggestion
 		}
+		body = body + "\n" + serviceutil.BuildMetaComment(fprint, g.toolName)
 
-		if !c.Result.InDiffFile || lnum == 0 || postedcs.IsPosted(c, lnum, body) {
-			continue
-		}
+		draftsCreated++
 		eg.Go(func() error {
 			pos := &gitlab.PositionOptions{
 				StartSHA:     gitlab.Ptr(targetBranch.Commit.ID),
@@ -129,18 +182,53 @@ func (g *MergeRequestDiscussionCommenter) postCommentsForEach(ctx context.Contex
 				pos.OldPath = gitlab.Ptr(c.Result.OldPath)
 				pos.OldLine = gitlab.Ptr(int64(c.Result.OldLine))
 			}
-			discussion := &gitlab.CreateMergeRequestDiscussionOptions{
-				Body:     gitlab.Ptr(body),
+			draftNote := &gitlab.CreateDraftNoteOptions{
+				Note:     gitlab.Ptr(body),
 				Position: pos,
 			}
-			_, _, err := g.cli.Discussions.CreateMergeRequestDiscussion(g.projects, int64(g.pr), discussion)
+			_, _, err := g.cli.DraftNotes.CreateDraftNote(g.projects, int64(g.pr), draftNote, gitlab.WithContext(ctx))
 			if err != nil {
-				return fmt.Errorf("failed to create merge request discussion: %w", err)
+				return fmt.Errorf("failed to create draft note: %w", err)
 			}
 			return nil
 		})
 	}
-	return eg.Wait()
+
+	// Create draft notes with resolve flag for outdated discussions
+	for _, d := range g.outdatedDiscussions {
+		d := d
+		if isDiscussionResolved(d) {
+			continue
+		}
+		draftsCreated++
+		eg.Go(func() error {
+			draftNote := &gitlab.CreateDraftNoteOptions{
+				Note:                  gitlab.Ptr("Issue resolved."),
+				InReplyToDiscussionID: gitlab.Ptr(d.ID),
+				ResolveDiscussion:     gitlab.Ptr(true),
+			}
+			_, _, err := g.cli.DraftNotes.CreateDraftNote(g.projects, int64(g.pr), draftNote, gitlab.WithContext(ctx))
+			if err != nil {
+				return fmt.Errorf("failed to create resolve draft note for discussion %s: %w", d.ID, err)
+			}
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return draftsCreated, err
+	}
+
+	return draftsCreated, nil
+}
+
+func isDiscussionResolved(d *gitlab.Discussion) bool {
+	for _, note := range d.Notes {
+		if note.Resolvable && !note.Resolved {
+			return false
+		}
+	}
+	return true
 }
 
 func listAllMergeRequestDiscussion(cli *gitlab.Client, projectID string, mergeRequest int, opts *gitlab.ListMergeRequestDiscussionsOptions) ([]*gitlab.Discussion, error) {
