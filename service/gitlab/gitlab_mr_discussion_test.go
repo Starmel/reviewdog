@@ -15,6 +15,7 @@ import (
 	"github.com/reviewdog/reviewdog/filter"
 	"github.com/reviewdog/reviewdog/proto/rdf"
 	"github.com/reviewdog/reviewdog/service/commentutil"
+	"github.com/reviewdog/reviewdog/service/serviceutil"
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 )
 
@@ -149,6 +150,22 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		},
 	}
 
+	// Outdated comment that should be deleted (not in current comments list)
+	outdatedComment := &reviewdog.Comment{
+		Result: &filter.FilteredDiagnostic{
+			Diagnostic: &rdf.Diagnostic{
+				Location: &rdf.Location{
+					Path: "outdated.go",
+					Range: &rdf.Range{Start: &rdf.Position{
+						Line: 10,
+					}},
+				},
+				Message: "outdated comment to delete",
+			},
+			InDiffFile: true,
+		},
+	}
+
 	comments := []*reviewdog.Comment{
 		alreadyCommented1,
 		alreadyCommented2,
@@ -160,7 +177,15 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		newCommentWithSuggestion,
 	}
 	var postCalled int32
+	var deleteCalled int32
 	const wantPostCalled = 4
+	const wantDeleteCalled = 1
+
+	// Helper to build body with meta comment
+	buildBodyWithMeta := func(c *reviewdog.Comment) string {
+		fprint, _ := serviceutil.Fingerprint(c.Result.Diagnostic)
+		return commentutil.MarkdownComment(c) + "\n" + serviceutil.BuildMetaComment(fprint, "test-tool")
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/discussions", func(w http.ResponseWriter, r *http.Request) {
@@ -170,15 +195,18 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 			default:
 				dls := []*gitlab.Discussion{
 					{
+						ID: "discussion-1",
 						Notes: []*gitlab.Note{
 							{
-								Body: commentutil.MarkdownComment(alreadyCommented1),
+								ID:   101,
+								Body: buildBodyWithMeta(alreadyCommented1),
 								Position: &gitlab.NotePosition{
 									NewPath: alreadyCommented1.Result.Diagnostic.GetLocation().GetPath(),
 									NewLine: int64(alreadyCommented1.Result.Diagnostic.GetLocation().GetRange().GetStart().GetLine()),
 								},
 							},
 							{
+								ID:   102,
 								Body: "unrelated commented",
 								Position: &gitlab.NotePosition{
 									NewPath: "file.go",
@@ -195,12 +223,28 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 			case "2":
 				dls := []*gitlab.Discussion{
 					{
+						ID: "discussion-2",
 						Notes: []*gitlab.Note{
 							{
-								Body: commentutil.MarkdownComment(alreadyCommented2),
+								ID:   201,
+								Body: buildBodyWithMeta(alreadyCommented2),
 								Position: &gitlab.NotePosition{
 									NewPath: alreadyCommented2.Result.Diagnostic.GetLocation().GetPath(),
 									NewLine: int64(alreadyCommented2.Result.Diagnostic.GetLocation().GetRange().GetStart().GetLine()),
+								},
+							},
+						},
+					},
+					{
+						// Outdated discussion that should be deleted
+						ID: "discussion-outdated",
+						Notes: []*gitlab.Note{
+							{
+								ID:   301,
+								Body: buildBodyWithMeta(outdatedComment),
+								Position: &gitlab.NotePosition{
+									NewPath: outdatedComment.Result.Diagnostic.GetLocation().GetPath(),
+									NewLine: int64(outdatedComment.Result.Diagnostic.GetLocation().GetRange().GetStart().GetLine()),
 								},
 							},
 						},
@@ -217,70 +261,78 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 			if err := json.NewDecoder(r.Body).Decode(got); err != nil {
 				t.Error(err)
 			}
+			// Verify body contains meta comment
+			if !strings.Contains(*got.Body, "<!-- __reviewdog__:") {
+				t.Errorf("body should contain meta comment, got: %s", *got.Body)
+			}
 			switch *got.Position.NewPath {
 			case "file.go":
-				want := &gitlab.CreateMergeRequestDiscussionOptions{
-					Body: gitlab.Ptr(commentutil.MarkdownComment(newComment1)),
-					Position: &gitlab.PositionOptions{
-						BaseSHA:      gitlab.Ptr("xxx"),
-						StartSHA:     gitlab.Ptr("xxx"),
-						HeadSHA:      gitlab.Ptr("sha"),
-						PositionType: gitlab.Ptr("text"),
-						NewPath:      gitlab.Ptr("file.go"),
-						NewLine:      gitlab.Ptr(int64(14)),
-					},
+				if !strings.Contains(*got.Body, commentutil.MarkdownComment(newComment1)) {
+					t.Errorf("body should contain comment, got: %s", *got.Body)
 				}
-				if diff := cmp.Diff(got, want); diff != "" {
+				wantPos := &gitlab.PositionOptions{
+					BaseSHA:      gitlab.Ptr("xxx"),
+					StartSHA:     gitlab.Ptr("xxx"),
+					HeadSHA:      gitlab.Ptr("sha"),
+					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file.go"),
+					NewPath:      gitlab.Ptr("file.go"),
+					NewLine:      gitlab.Ptr(int64(14)),
+				}
+				if diff := cmp.Diff(got.Position, wantPos); diff != "" {
 					t.Error(diff)
 				}
 			case "file2.go":
-				want := &gitlab.CreateMergeRequestDiscussionOptions{
-					Body: gitlab.Ptr(commentutil.MarkdownComment(newComment2)),
-					Position: &gitlab.PositionOptions{
-						BaseSHA:      gitlab.Ptr("xxx"),
-						StartSHA:     gitlab.Ptr("xxx"),
-						HeadSHA:      gitlab.Ptr("sha"),
-						PositionType: gitlab.Ptr("text"),
-						NewPath:      gitlab.Ptr("file2.go"),
-						NewLine:      gitlab.Ptr(int64(15)),
-					},
+				if !strings.Contains(*got.Body, commentutil.MarkdownComment(newComment2)) {
+					t.Errorf("body should contain comment, got: %s", *got.Body)
 				}
-				if diff := cmp.Diff(got, want); diff != "" {
+				wantPos := &gitlab.PositionOptions{
+					BaseSHA:      gitlab.Ptr("xxx"),
+					StartSHA:     gitlab.Ptr("xxx"),
+					HeadSHA:      gitlab.Ptr("sha"),
+					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file2.go"),
+					NewPath:      gitlab.Ptr("file2.go"),
+					NewLine:      gitlab.Ptr(int64(15)),
+				}
+				if diff := cmp.Diff(got.Position, wantPos); diff != "" {
 					t.Error(diff)
 				}
 			case "new_file.go":
-				want := &gitlab.CreateMergeRequestDiscussionOptions{
-					Body: gitlab.Ptr(commentutil.MarkdownComment(newComment3)),
-					Position: &gitlab.PositionOptions{
-						BaseSHA:      gitlab.Ptr("xxx"),
-						StartSHA:     gitlab.Ptr("xxx"),
-						HeadSHA:      gitlab.Ptr("sha"),
-						PositionType: gitlab.Ptr("text"),
-						NewPath:      gitlab.Ptr("new_file.go"),
-						NewLine:      gitlab.Ptr(int64(14)),
-						OldPath:      gitlab.Ptr("old_file.go"),
-						OldLine:      gitlab.Ptr(int64(7)),
-					},
+				if !strings.Contains(*got.Body, commentutil.MarkdownComment(newComment3)) {
+					t.Errorf("body should contain comment, got: %s", *got.Body)
 				}
-				if diff := cmp.Diff(got, want); diff != "" {
+				wantPos := &gitlab.PositionOptions{
+					BaseSHA:      gitlab.Ptr("xxx"),
+					StartSHA:     gitlab.Ptr("xxx"),
+					HeadSHA:      gitlab.Ptr("sha"),
+					PositionType: gitlab.Ptr("text"),
+					NewPath:      gitlab.Ptr("new_file.go"),
+					NewLine:      gitlab.Ptr(int64(14)),
+					OldPath:      gitlab.Ptr("old_file.go"),
+					OldLine:      gitlab.Ptr(int64(7)),
+				}
+				if diff := cmp.Diff(got.Position, wantPos); diff != "" {
 					t.Error(diff)
 				}
 			case "file3.go":
 				suggestions := buildSuggestions(newCommentWithSuggestion)
-				bodyExpected := commentutil.MarkdownComment(newCommentWithSuggestion) + "\n\n" + suggestions
-
-				want := &gitlab.CreateMergeRequestDiscussionOptions{
-					Body: gitlab.Ptr(bodyExpected),
-					Position: &gitlab.PositionOptions{
-						BaseSHA:      gitlab.Ptr("xxx"),
-						StartSHA:     gitlab.Ptr("xxx"),
-						HeadSHA:      gitlab.Ptr("sha"),
-						PositionType: gitlab.Ptr("text"),
-						NewPath:      gitlab.Ptr("file3.go"),
-						NewLine:      gitlab.Ptr(int64(14)),
-					},
+				if !strings.Contains(*got.Body, commentutil.MarkdownComment(newCommentWithSuggestion)) {
+					t.Errorf("body should contain comment, got: %s", *got.Body)
 				}
-				if diff := cmp.Diff(got, want); diff != "" {
+				if !strings.Contains(*got.Body, suggestions) {
+					t.Errorf("body should contain suggestions, got: %s", *got.Body)
+				}
+				wantPos := &gitlab.PositionOptions{
+					BaseSHA:      gitlab.Ptr("xxx"),
+					StartSHA:     gitlab.Ptr("xxx"),
+					HeadSHA:      gitlab.Ptr("sha"),
+					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file3.go"),
+					NewPath:      gitlab.Ptr("file3.go"),
+					NewLine:      gitlab.Ptr(int64(14)),
+				}
+				if diff := cmp.Diff(got.Position, wantPos); diff != "" {
 					t.Error(diff)
 				}
 			default:
@@ -292,6 +344,14 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		default:
 			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
 		}
+	})
+	// Handler for deleting discussion notes
+	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/discussions/discussion-outdated/notes/301", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected method: %v, want DELETE", r.Method)
+		}
+		atomic.AddInt32(&deleteCalled, 1)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -314,7 +374,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		t.Fatal(err)
 	}
 
-	g := NewGitLabMergeRequestDiscussionCommenter(cli, "o", "r", 14, "sha")
+	g := NewGitLabMergeRequestDiscussionCommenter(cli, "o", "r", 14, "sha", "test-tool")
 
 	for _, c := range comments {
 		if err := g.Post(context.Background(), c); err != nil {
@@ -326,6 +386,9 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 	}
 	if postCalled != wantPostCalled {
 		t.Errorf("%d discussions posted, but want %d", postCalled, wantPostCalled)
+	}
+	if deleteCalled != wantDeleteCalled {
+		t.Errorf("%d discussions deleted, but want %d", deleteCalled, wantDeleteCalled)
 	}
 }
 
