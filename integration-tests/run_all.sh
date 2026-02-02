@@ -31,7 +31,7 @@ TESTS=(
     "test_01_create_mr.sh"
     "test_02_post_comment.sh"
     "test_03_deduplication.sh"
-    "test_04_resolve_outdated.sh"
+    "test_04_delete_outdated.sh"
     "test_05_multiple_tools.sh"
     "test_06_suggestions.sh"
     "test_07_empty_toolname.sh"
@@ -40,7 +40,7 @@ TESTS=(
     "test_10_large_batch.sh"
     "test_11_api_error_handling.sh"
     "test_12_legacy_comments.sh"
-    "test_13_single_batch_create_and_resolve.sh"
+    "test_13_single_batch_create_and_delete.sh"
 )
 
 PASSED=0

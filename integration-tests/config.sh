@@ -2,9 +2,15 @@
 
 # GitLab configuration
 export GITLAB_URL="http://localhost:8080"
+export GITLAB_HOST="localhost:8080"
 export GITLAB_API="$GITLAB_URL/api/v4"
 export GITLAB_TOKEN="glpat-reviewdog-test-token123"
 export REVIEWDOG_GITLAB_API_TOKEN="$GITLAB_TOKEN"
+
+# Batch mode credentials (for test_14)
+export GITLAB_PASSWORD="${GITLAB_PASSWORD:-ReviewDog123!}"
+export REVIEWDOG_GITLAB_USERNAME="root"
+export REVIEWDOG_GITLAB_PASSWORD="$GITLAB_PASSWORD"
 
 # Project configuration
 export CI_REPO_OWNER="root"

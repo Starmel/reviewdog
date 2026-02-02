@@ -2,13 +2,21 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/config.sh"
 
-echo "=== Test 13: Single Batch Create and Resolve ==="
-echo "Tests that new comments + resolve of old comments happen in ONE bulk_publish"
+# Allow override of GITLAB_TOKEN before sourcing config
+GITLAB_TOKEN_OVERRIDE="${GITLAB_TOKEN:-}"
+source "$SCRIPT_DIR/config.sh"
+if [ -n "$GITLAB_TOKEN_OVERRIDE" ]; then
+    export GITLAB_TOKEN="$GITLAB_TOKEN_OVERRIDE"
+    export REVIEWDOG_GITLAB_API_TOKEN="$GITLAB_TOKEN"
+fi
+
+echo "=== Test 13: Single Batch Create and Delete ==="
+echo "Tests that new comments are created and old comments are DELETED (not resolved)"
+echo "DELETE does not send email notifications"
 
 # Create a fresh MR for this test
-info "Creating fresh MR for batch test..."
+info "Creating fresh MR for delete test..."
 
 # Delete old branch if exists
 curl -s -X DELETE "$GITLAB_URL/api/v4/projects/$PROJECT_ID/repository/branches/feature-single-batch" \
@@ -52,9 +60,10 @@ MR_IID=$(echo "$MR_RESULT" | jq -r '.iid')
 MR_SHA=$(echo "$MR_RESULT" | jq -r '.sha')
 pass "MR created: IID=$MR_IID"
 
-# Clone repo
+# Clone repo (use password for git, not token)
+GIT_PASSWORD="${GITLAB_PASSWORD:-ReviewDog123!}"
 rm -rf "$TEST_REPO_DIR"
-git clone "http://root:$GITLAB_TOKEN@localhost:8080/root/test-reviewdog.git" "$TEST_REPO_DIR" 2>/dev/null
+git clone "http://root:$GIT_PASSWORD@${GITLAB_HOST:-localhost:8080}/root/test-reviewdog.git" "$TEST_REPO_DIR" 2>/dev/null
 cd "$TEST_REPO_DIR"
 git fetch origin feature-single-batch
 git checkout feature-single-batch
@@ -77,7 +86,7 @@ if [ "$INITIAL_COUNT" -ne 3 ]; then
 fi
 pass "3 initial comments created"
 
-# Step 2: Add a manual user comment (should NOT be resolved by reviewdog)
+# Step 2: Add a manual user comment (should NOT be deleted by reviewdog)
 info "Step 2: Adding manual user discussion (not from reviewdog)..."
 MR_INFO=$(curl -s "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests/$MR_IID" \
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN")
@@ -88,7 +97,7 @@ curl -s -X POST "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests/$MR_IID/
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
     -H "Content-Type: application/json" \
     -d "$(jq -n \
-        --arg body "This is a manual user comment - should NOT be auto-resolved!" \
+        --arg body "This is a manual user comment - should NOT be auto-deleted!" \
         --arg base "$TARGET_SHA" \
         --arg head "$MR_SHA" \
         '{
@@ -105,8 +114,13 @@ curl -s -X POST "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests/$MR_IID/
 
 pass "Manual user discussion added on line 5"
 
-# Step 3: Run with DIFFERENT errors (should create 2 new + resolve 3 old in ONE operation)
-info "Step 3: Running with 2 new errors (old 3 should be resolved, user comment NOT)..."
+# Verify we have 4 discussions now (3 old + 1 user)
+COUNT_BEFORE=$(curl -s "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests/$MR_IID/discussions" \
+    -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '[.[] | select(.notes[0].position != null)] | length')
+info "Discussions before second run: $COUNT_BEFORE"
+
+# Step 3: Run with DIFFERENT errors (should create 2 new + DELETE 3 old)
+info "Step 3: Running with 2 new errors (old 3 should be DELETED, user comment NOT)..."
 echo -e 'single_batch_test.go:3:1: missing doc\nsingle_batch_test.go:7:1: missing return' | \
     "$REVIEWDOG_BIN" -reporter=gitlab-mr-discussion -name=batch-test -f=golint
 
@@ -115,48 +129,43 @@ DISCUSSIONS=$(curl -s "$GITLAB_URL/api/v4/projects/$PROJECT_ID/merge_requests/$M
     -H "PRIVATE-TOKEN: $GITLAB_TOKEN" | jq '[.[] | select(.notes[0].position != null)]')
 
 TOTAL_COUNT=$(echo "$DISCUSSIONS" | jq 'length')
-RESOLVED_COUNT=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].resolved == true)] | length')
-UNRESOLVED_COUNT=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].resolved == false)] | length')
+info "Total discussions after delete: $TOTAL_COUNT"
 
-info "Total discussions: $TOTAL_COUNT"
-info "Resolved: $RESOLVED_COUNT"
-info "Unresolved: $UNRESOLVED_COUNT"
+# After delete: should have 2 new + 1 user = 3 discussions total
+# (the 3 old "unused" comments should be deleted)
+if [ "$TOTAL_COUNT" -ne 3 ]; then
+    fail "Expected 3 discussions (2 new + 1 user), got $TOTAL_COUNT"
+fi
+pass "Correct count after delete: 3 discussions"
 
-# Verify old comments are resolved
-OLD_RESOLVED=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].body | contains("unused old"))] | [.[] | .notes[0].resolved] | all')
-if [ "$OLD_RESOLVED" == "true" ]; then
-    pass "All 3 old comments are resolved"
+# Verify old comments are DELETED (not present)
+OLD_COMMENTS=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].body | contains("unused old"))] | length')
+if [ "$OLD_COMMENTS" -eq 0 ]; then
+    pass "All 3 old comments were DELETED"
 else
-    fail "Not all old comments are resolved"
+    fail "Old comments should be deleted, but found $OLD_COMMENTS"
 fi
 
-# Verify new comments are unresolved
-NEW_UNRESOLVED=$(echo "$DISCUSSIONS" | jq '[.[] | select((.notes[0].body | contains("missing doc")) or (.notes[0].body | contains("missing return")))] | [.[] | .notes[0].resolved == false] | all')
-if [ "$NEW_UNRESOLVED" == "true" ]; then
-    pass "All 2 new comments are unresolved"
+# Verify new comments exist
+NEW_COMMENTS=$(echo "$DISCUSSIONS" | jq '[.[] | select((.notes[0].body | contains("missing doc")) or (.notes[0].body | contains("missing return")))] | length')
+if [ "$NEW_COMMENTS" -eq 2 ]; then
+    pass "2 new comments were created"
 else
-    fail "New comments should be unresolved"
+    fail "Expected 2 new comments, got $NEW_COMMENTS"
 fi
 
-# Verify counts (3 old resolved + 2 new unresolved + 1 user unresolved = 6 total)
-if [ "$RESOLVED_COUNT" -eq 3 ] && [ "$UNRESOLVED_COUNT" -eq 3 ]; then
-    pass "Correct counts: 3 resolved, 3 unresolved (2 new + 1 user)"
+# Verify user comment was NOT deleted
+USER_COMMENT=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].body | contains("manual user comment"))] | length')
+if [ "$USER_COMMENT" -eq 1 ]; then
+    pass "User manual comment was NOT deleted (correct!)"
 else
-    fail "Expected 3 resolved + 3 unresolved, got $RESOLVED_COUNT resolved + $UNRESOLVED_COUNT unresolved"
+    fail "User manual comment was incorrectly deleted"
 fi
 
-# Verify user comment was NOT resolved
-USER_COMMENT_RESOLVED=$(echo "$DISCUSSIONS" | jq '[.[] | select(.notes[0].body | contains("manual user comment"))] | .[0].notes[0].resolved')
-if [ "$USER_COMMENT_RESOLVED" == "false" ]; then
-    pass "User manual comment was NOT auto-resolved (correct!)"
-else
-    fail "User manual comment was incorrectly resolved: $USER_COMMENT_RESOLVED"
-fi
-
-# Note about single notification
+# Note about no notifications
 echo ""
-info "NOTE: All changes (2 new + 3 resolves) were done via Draft Notes API"
-info "with a single bulk_publish call = ONE email notification"
+info "NOTE: DELETE operation does NOT send email notifications"
+info "Old comments are completely removed from the MR"
 info "User manual comment was preserved and NOT touched by reviewdog"
 
 echo ""

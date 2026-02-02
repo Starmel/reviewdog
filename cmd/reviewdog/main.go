@@ -156,6 +156,13 @@ const (
 		Alternatively, GITLAB_API can also be defined, and it will take precedence over the former:
 			$ export GITLAB_API="https://example.gitlab.com/api/v4"
 
+		Batch mode (optional, reduces email notifications):
+		For older GitLab versions (e.g., 16.0.8) where the API doesn't support batch operations,
+		you can enable batch mode to create draft notes and publish them all at once:
+			$ export REVIEWDOG_GITLAB_BATCH_MODE=true
+			$ export REVIEWDOG_GITLAB_USERNAME="your_username"
+			$ export REVIEWDOG_GITLAB_PASSWORD="your_password"
+
 	"gitlab-mr-commit"
 		Same as gitlab-mr-discussion, but report results to GitLab comments for
 		each commits in Merge Requests.

@@ -150,6 +150,22 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		},
 	}
 
+	// Outdated comment that should be deleted (not in current comments list)
+	outdatedComment := &reviewdog.Comment{
+		Result: &filter.FilteredDiagnostic{
+			Diagnostic: &rdf.Diagnostic{
+				Location: &rdf.Location{
+					Path: "outdated.go",
+					Range: &rdf.Range{Start: &rdf.Position{
+						Line: 10,
+					}},
+				},
+				Message: "outdated comment to delete",
+			},
+			InDiffFile: true,
+		},
+	}
+
 	comments := []*reviewdog.Comment{
 		alreadyCommented1,
 		alreadyCommented2,
@@ -161,7 +177,9 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 		newCommentWithSuggestion,
 	}
 	var postCalled int32
+	var deleteCalled int32
 	const wantPostCalled = 4
+	const wantDeleteCalled = 1
 
 	// Helper to build body with meta comment
 	buildBodyWithMeta := func(c *reviewdog.Comment) string {
@@ -180,6 +198,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 						ID: "discussion-1",
 						Notes: []*gitlab.Note{
 							{
+								ID:   101,
 								Body: buildBodyWithMeta(alreadyCommented1),
 								Position: &gitlab.NotePosition{
 									NewPath: alreadyCommented1.Result.Diagnostic.GetLocation().GetPath(),
@@ -187,6 +206,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 								},
 							},
 							{
+								ID:   102,
 								Body: "unrelated commented",
 								Position: &gitlab.NotePosition{
 									NewPath: "file.go",
@@ -206,10 +226,25 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 						ID: "discussion-2",
 						Notes: []*gitlab.Note{
 							{
+								ID:   201,
 								Body: buildBodyWithMeta(alreadyCommented2),
 								Position: &gitlab.NotePosition{
 									NewPath: alreadyCommented2.Result.Diagnostic.GetLocation().GetPath(),
 									NewLine: int64(alreadyCommented2.Result.Diagnostic.GetLocation().GetRange().GetStart().GetLine()),
+								},
+							},
+						},
+					},
+					{
+						// Outdated discussion that should be deleted
+						ID: "discussion-outdated",
+						Notes: []*gitlab.Note{
+							{
+								ID:   301,
+								Body: buildBodyWithMeta(outdatedComment),
+								Position: &gitlab.NotePosition{
+									NewPath: outdatedComment.Result.Diagnostic.GetLocation().GetPath(),
+									NewLine: int64(outdatedComment.Result.Diagnostic.GetLocation().GetRange().GetStart().GetLine()),
 								},
 							},
 						},
@@ -240,6 +275,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 					StartSHA:     gitlab.Ptr("xxx"),
 					HeadSHA:      gitlab.Ptr("sha"),
 					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file.go"),
 					NewPath:      gitlab.Ptr("file.go"),
 					NewLine:      gitlab.Ptr(int64(14)),
 				}
@@ -255,6 +291,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 					StartSHA:     gitlab.Ptr("xxx"),
 					HeadSHA:      gitlab.Ptr("sha"),
 					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file2.go"),
 					NewPath:      gitlab.Ptr("file2.go"),
 					NewLine:      gitlab.Ptr(int64(15)),
 				}
@@ -291,6 +328,7 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 					StartSHA:     gitlab.Ptr("xxx"),
 					HeadSHA:      gitlab.Ptr("sha"),
 					PositionType: gitlab.Ptr("text"),
+					OldPath:      gitlab.Ptr("file3.go"),
 					NewPath:      gitlab.Ptr("file3.go"),
 					NewLine:      gitlab.Ptr(int64(14)),
 				}
@@ -307,6 +345,14 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
 		}
 	})
+	// Handler for deleting discussion notes
+	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/discussions/discussion-outdated/notes/301", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("unexpected method: %v, want DELETE", r.Method)
+		}
+		atomic.AddInt32(&deleteCalled, 1)
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
@@ -318,32 +364,6 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
 		}
 		w.Write([]byte(`{"commit": {"id": "xxx"}}`))
-	})
-	// Draft Notes API handlers
-	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/draft_notes", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			atomic.AddInt32(&postCalled, 1)
-			got := new(gitlab.CreateDraftNoteOptions)
-			if err := json.NewDecoder(r.Body).Decode(got); err != nil {
-				t.Error(err)
-			}
-			// Verify body contains meta comment
-			if !strings.Contains(*got.Note, "<!-- __reviewdog__:") {
-				t.Errorf("body should contain meta comment, got: %s", *got.Note)
-			}
-			if err := json.NewEncoder(w).Encode(gitlab.DraftNote{ID: 1}); err != nil {
-				t.Fatal(err)
-			}
-		default:
-			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
-		}
-	})
-	mux.HandleFunc("/api/v4/projects/o%2Fr/merge_requests/14/draft_notes/bulk_publish", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("unexpected access: %v %v", r.Method, r.URL)
-		}
-		w.WriteHeader(http.StatusNoContent)
 	})
 
 	ts := httptest.NewServer(mux)
@@ -366,6 +386,9 @@ func TestGitLabMergeRequestDiscussionCommenter_Post_Flush_review_api(t *testing.
 	}
 	if postCalled != wantPostCalled {
 		t.Errorf("%d discussions posted, but want %d", postCalled, wantPostCalled)
+	}
+	if deleteCalled != wantDeleteCalled {
+		t.Errorf("%d discussions deleted, but want %d", deleteCalled, wantDeleteCalled)
 	}
 }
 
